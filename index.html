@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Spritesheet Context Editor</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root {
+  --panel-bg: #1e1e1e;    /* panels */
+  --line: #333;           /* borders */
+  --accent: #ffeb3b40;    /* highlight background */
+  --outline: #ffd400cc;   /* selection box */
+  --text: #ddd;           /* text */
+}
+  body { margin:0; font:14px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; color:var(--text); background:#111; }
+  header { padding:10px 14px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:center; flex-wrap:wrap; background: #181818 }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  .controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .controls label { display:flex; align-items:center; gap:6px; }
+  .controls input[type="range"] { width:160px; }
+  .controls button, .controls input[type="file"]::file-selector-button {
+    padding:6px 10px; border:1px solid #ccc; background:#fff; border-radius:6px; cursor:pointer;
+  }
+  .note { color:#888; font-size:12px; }
+  .layout { display:grid; grid-template-columns: 1fr auto 1fr; gap:12px; padding:12px; }
+  .panel { background:var(--panel-bg); border:1px solid var(--line); border-radius:10px; padding:10px; display:flex; flex-direction:column; gap:8px; }
+  .panel h2 { margin:0; font-size:13px; font-weight:600; color:#333; }
+  .canvas-wrap { position:relative; overflow:auto; background:#000; border:1px solid var(--line); border-radius:8px; }
+  canvas { display:block; image-rendering: pixelated; }
+  .selection-outline { position:absolute; border:2px solid var(--outline); outline: 0; pointer-events:none; box-shadow:0 0 0 9999px #ffd40018 inset; }
+  .palette { display:flex; flex-wrap:wrap; gap:6px; max-height:130px; overflow:auto; padding:6px; background:#111; border:1px solid var(--line); border-radius:8px; }
+  .swatch { width:24px; height:24px; border-radius:4px; border:1px solid #444; cursor:pointer; }
+  .swatch[aria-current="true"] { outline:2px solid #333; }
+  .status { font-size:12px; color:#aaa; display:flex; gap:14px; flex-wrap:wrap; }
+  .zoom { background:#111; padding:10px; border-radius:10px; display:flex; flex-direction:column; gap:8px; align-items:center; justify-content:center; }
+  .zoom canvas { background:#222; border:1px solid #333; border-radius:6px; }
+  .bad { color:#a00; }
+  .good { color:#0a0; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Spritesheet Context Editor</h1>
+    <div class="controls">
+      <label>Load: <input id="fileInput" type="file" accept="image/*"></label>
+      <button id="undoBtn" title="Revert edited image back to original">Undo all changes</button>
+      <label>Context size <span id="ctxSizeLabel">5</span>
+        <input id="ctxSize" type="range" min="3" max="10" step="1" value="5">
+      </label>
+      <span class="note">Tip: click on the left image to set the 21×21 edit region. Paste an image with Ctrl/Cmd+V.</span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <!-- Left: Source (original) -->
+    <section class="panel">
+      <h2>Source (original)</h2>
+      <div class="canvas-wrap" id="leftWrap">
+        <canvas id="leftCanvas"></canvas>
+        <div id="selectionOutline" class="selection-outline" hidden></div>
+      </div>
+      <div class="status" id="leftStatus"></div>
+      <div>
+        <h3 style="margin:6px 0 4px; font-size:12px; color:#555;">Palette (auto from image)</h3>
+        <div id="palette" class="palette" title="Click to set paint color"></div>
+      </div>
+    </section>
+
+    <!-- Center: Zoom editor -->
+    <section class="panel zoom">
+      <h2 style="color:#eee;">Zoom editor (21 × 21)</h2>
+      <canvas id="zoomCanvas" width="210" height="210" title="Left-click (or drag) to paint"></canvas>
+      <div class="status" id="zoomStatus" style="color:#ddd;"></div>
+    </section>
+
+    <!-- Right: Edited -->
+    <section class="panel">
+      <h2>Edited (live)</h2>
+      <div class="canvas-wrap">
+        <canvas id="rightCanvas"></canvas>
+      </div>
+      <div class="status" id="rightStatus"></div>
+    </section>
+  </div>
+
+<script>
+(() => {
+  // ====== DOM elements ======
+  const leftCanvas = document.getElementById('leftCanvas');
+  const rightCanvas = document.getElementById('rightCanvas');
+  const zoomCanvas = document.getElementById('zoomCanvas');
+  const leftWrap = document.getElementById('leftWrap');
+  const selectionOutline = document.getElementById('selectionOutline');
+  const fileInput = document.getElementById('fileInput');
+  const undoBtn = document.getElementById('undoBtn');
+  const ctxSizeInput = document.getElementById('ctxSize');
+  const ctxSizeLabel = document.getElementById('ctxSizeLabel');
+  const paletteEl = document.getElementById('palette');
+  const leftStatus = document.getElementById('leftStatus');
+  const zoomStatus = document.getElementById('zoomStatus');
+  const rightStatus = document.getElementById('rightStatus');
+
+  const lctx = leftCanvas.getContext('2d', { willReadFrequently: true });
+  const rctx = rightCanvas.getContext('2d', { willReadFrequently: true });
+  const zctx = zoomCanvas.getContext('2d', { willReadFrequently: true });
+
+  // ====== State ======
+  let iw = 0, ih = 0;                         // image width/height
+  let originalImgData = null;                 // ImageData of original
+  let editedImgData = null;                   // ImageData of edited
+  let currentColor = [255, 0, 0, 255];        // default red
+  let selection = null;                       // {x, y} center pixel for 21x21 and context
+  let matchCenters = [];                      // [{x,y}, ...] centers where context matches
+  let ctxSize = 5;                            // context box size (odd 3..10)
+  const ZS = 10;                              // zoom scale: 21*10 = 210px canvas
+  const HALF = 10;                            // 21x21 => half-span
+  let isPainting = false;
+
+  // ====== Helpers ======
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+  function idx(x, y, w) { return (y * w + x) * 4; }
+
+  function getPixel(data, x, y, w) {
+    const i = idx(x, y, w);
+    return [data[i], data[i+1], data[i+2], data[i+3]];
+  }
+  function setPixel(data, x, y, w, rgba) {
+    const i = idx(x, y, w);
+    data[i] = rgba[0]; data[i+1] = rgba[1]; data[i+2] = rgba[2]; data[i+3] = rgba[3];
+  }
+  function rgbaEq(a, b) { return a[0]===b[0] && a[1]===b[1] && a[2]===b[2] && a[3]===b[3]; }
+  function colorToCss([r,g,b,a]) { return `rgba(${r},${g},${b},${(a/255).toFixed(3)})`; }
+
+  function ensureOdd(n) { return n % 2 ? n : Math.max(3, Math.min(9, n-1)); }
+
+  function drawBoth() {
+    // left shows original
+    lctx.putImageData(new ImageData(new Uint8ClampedArray(originalImgData.data), iw, ih), 0, 0);
+    // right shows edited
+    rctx.putImageData(new ImageData(new Uint8ClampedArray(editedImgData.data), iw, ih), 0, 0);
+  }
+
+  function updateSelectionOutline() {
+    if (!selection) { selectionOutline.hidden = true; return; }
+    selectionOutline.hidden = false;
+    // position in CSS pixels: 1 canvas pixel == 1 CSS pixel (we keep 1:1 default)
+    const x = selection.x - HALF;
+    const y = selection.y - HALF;
+    selectionOutline.style.left = `${x}px`;
+    selectionOutline.style.top = `${y}px`;
+    selectionOutline.style.width = `${21}px`;
+    selectionOutline.style.height = `${21}px`;
+  }
+
+  function drawZoom() {
+    // Draw 21x21 from edited image centered at selection into zoom, scaled (nearest neighbor)
+    zctx.fillStyle = "#222";
+    zctx.fillRect(0,0,zoomCanvas.width, zoomCanvas.height);
+    if (!selection) {
+      zoomStatus.textContent = "No selection. Click on the left image.";
+      return;
+    }
+    const sx0 = selection.x - HALF, sy0 = selection.y - HALF;
+    // Build tiny ImageData 21x21 then scale by drawing each pixel as ZS×ZS rect
+    for (let dy=0; dy<21; dy++) {
+      for (let dx=0; dx<21; dx++) {
+        const x = sx0 + dx, y = sy0 + dy;
+        const [r,g,b,a] = getPixel(editedImgData.data, x, y, iw);
+        zctx.fillStyle = colorToCss([r,g,b,a]);
+        zctx.fillRect(dx*ZS, dy*ZS, ZS, ZS);
+      }
+    }
+    // Grid lines (optional, subtle)
+    zctx.strokeStyle = "rgba(255,255,255,0.15)";
+    for (let i=0;i<=21;i++) {
+      zctx.beginPath(); zctx.moveTo(0, i*ZS+0.5); zctx.lineTo(21*ZS, i*ZS+0.5); zctx.stroke();
+      zctx.beginPath(); zctx.moveTo(i*ZS+0.5, 0); zctx.lineTo(i*ZS+0.5, 21*ZS); zctx.stroke();
+    }
+    // Crosshair at center
+    zctx.strokeStyle = "rgba(255,255,0,0.6)";
+    zctx.lineWidth = 2;
+    zctx.strokeRect(HALF*ZS, HALF*ZS, ZS, ZS);
+
+    zoomStatus.innerHTML = `Selection: <b>(${selection.x}, ${selection.y})</b> • Matches: <b>${matchCenters.length}</b> • Paint color: <span style="display:inline-block;width:10px;height:10px;border:1px solid #888;background:${colorToCss(currentColor)}"></span>`;
+  }
+
+  function recalcMatches() {
+    matchCenters = [];
+    if (!selection || !originalImgData) return;
+    const k = ensureOdd(ctxSize);
+    const h = (k-1)/2;
+
+    // Extract context patch at selection from ORIGINAL image
+    const selPatch = new Uint32Array(k*k*4);
+    let p = 0;
+    for (let dy=-h; dy<=h; dy++) {
+      for (let dx=-h; dx<=h; dx++) {
+        const [r,g,b,a] = getPixel(originalImgData.data, selection.x+dx, selection.y+dy, iw);
+        selPatch[p++] = r; selPatch[p++] = g; selPatch[p++] = b; selPatch[p++] = a;
+      }
+    }
+
+    // Scan all positions where context fits
+    for (let y=h; y<ih-h; y++) {
+      scanX: for (let x=h; x<iw-h; x++) {
+        // quick center-pixel check first
+        const cp = getPixel(originalImgData.data, x, y, iw);
+        const scp = [ selPatch[(h*k + h)*4+0], selPatch[(h*k + h)*4+1], selPatch[(h*k + h)*4+2], selPatch[(h*k + h)*4+3] ];
+        if (!rgbaEq(cp, scp)) continue;
+
+        // full compare
+        let pi = 0;
+        for (let dy=-h; dy<=h; dy++) {
+          for (let dx=-h; dx<=h; dx++) {
+            const [r,g,b,a] = getPixel(originalImgData.data, x+dx, y+dy, iw);
+            if (r!==selPatch[pi] || g!==selPatch[pi+1] || b!==selPatch[pi+2] || a!==selPatch[pi+3]) {
+              // mismatch: continue outer loop
+              pi += 4;
+              continue scanX;
+            }
+            pi += 4;
+          }
+        }
+
+        // Skip matches that lie inside the 21×21 zoom view around the selection,
+        // except the selection center itself. This prevents “extra” pixels showing
+        // up in the zoom pane.
+        if (Math.abs(x - selection.x) <= HALF && Math.abs(y - selection.y) <= HALF) {
+          if (!(x === selection.x && y === selection.y)) {
+            continue; // keep scanning; don't add this nearby match
+          }
+        }
+
+        matchCenters.push({ x, y });
+      }
+    }
+  }
+
+  function applyPaintAt(dx, dy, rgba) {
+    // dx,dy are offsets relative to selection center within 21×21 (e.g., -10..+10)
+    if (!selection) return;
+    for (const m of matchCenters) {
+      const x = m.x + dx;
+      const y = m.y + dy;
+      if (x>=0 && x<iw && y>=0 && y<ih) {
+        setPixel(editedImgData.data, x, y, iw, rgba);
+      }
+    }
+    // Also make sure the base selection itself is painted (in case matches list was empty due to context constraints)
+    const bx = selection.x + dx, by = selection.y + dy;
+    if (bx>=0 && bx<iw && by>=0 && by<ih) {
+      setPixel(editedImgData.data, bx, by, iw, rgba);
+    }
+    // redraw right and zoom
+    rctx.putImageData(new ImageData(new Uint8ClampedArray(editedImgData.data), iw, ih), 0, 0);
+    drawZoom();
+  }
+
+  function pickImageAndInit(img) {
+    // Set canvas sizes and image data
+    iw = img.naturalWidth; ih = img.naturalHeight;
+    [leftCanvas.width, leftCanvas.height] = [iw, ih];
+    [rightCanvas.width, rightCanvas.height] = [iw, ih];
+
+    lctx.clearRect(0,0,iw,ih);
+    rctx.clearRect(0,0,iw,ih);
+    lctx.drawImage(img,0,0);
+    rctx.drawImage(img,0,0);
+
+    originalImgData = lctx.getImageData(0,0,iw,ih);
+    editedImgData   = rctx.getImageData(0,0,iw,ih);
+
+    // build palette
+    buildPaletteFrom(originalImgData);
+
+    // reset selection/matches
+    selection = null;
+    matchCenters = [];
+    updateSelectionOutline();
+    drawBoth();
+    drawZoom();
+    leftStatus.textContent = `Loaded ${iw}×${ih}. Click to select edit center (needs ≥10px margin for 21×21).`;
+    rightStatus.textContent = `Edited image (live).`;
+  }
+
+  async function loadBlobAsImage(blob) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+      img.onerror = e => { URL.revokeObjectURL(url); reject(e); };
+      img.src = url;
+    });
+  }
+
+  function buildPaletteFrom(imageData) {
+    paletteEl.innerHTML = '';
+    const map = new Map();
+    const d = imageData.data;
+    for (let i=0; i<d.length; i+=4) {
+      const key = `${d[i]},${d[i+1]},${d[i+2]},${d[i+3]}`;
+      map.set(key, (map.get(key)||0)+1);
+    }
+    // sort by frequency desc, cap to 512 to be safe
+    const colors = [...map.entries()].sort((a,b)=>b[1]-a[1]).slice(0,512).map(([k])=>k.split(',').map(n=>+n));
+    // Ensure currentColor is present
+    const curKey = currentColor.join(',');
+    if (!map.has(curKey)) colors.unshift(currentColor);
+
+    colors.forEach((rgba, i) => {
+      const sw = document.createElement('button');
+      sw.className = 'swatch';
+      sw.style.background = colorToCss(rgba);
+      sw.title = `rgba(${rgba.join(',')})`;
+      if (rgba.join(',')===curKey) sw.setAttribute('aria-current', 'true');
+      sw.addEventListener('click', () => {
+        currentColor = rgba.slice();
+        [...paletteEl.children].forEach(c => c.removeAttribute('aria-current'));
+        sw.setAttribute('aria-current', 'true');
+        drawZoom();
+      });
+      paletteEl.appendChild(sw);
+    });
+  }
+
+  // ====== Events ======
+
+  // Upload
+  fileInput.addEventListener('change', async (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    try {
+      const img = await loadBlobAsImage(f);
+      pickImageAndInit(img);
+    } catch (err) {
+      leftStatus.innerHTML = `<span class="bad">Failed to load image.</span>`;
+      console.error(err);
+    } finally {
+      fileInput.value = '';
+    }
+  });
+
+  // Paste from clipboard
+  window.addEventListener('paste', async (e) => {
+    if (!e.clipboardData) return;
+    const item = [...e.clipboardData.items].find(it => it.type.startsWith('image/'));
+    if (!item) return;
+    try {
+      const blob = item.getAsFile();
+      const img = await loadBlobAsImage(blob);
+      pickImageAndInit(img);
+      leftStatus.innerHTML = `<span class="good">Pasted ${iw}×${ih} image.</span>`;
+    } catch (err) {
+      leftStatus.innerHTML = `<span class="bad">Paste failed.</span>`;
+      console.error(err);
+    }
+  });
+
+  // Select center on left canvas
+  leftCanvas.addEventListener('click', (e) => {
+    if (!originalImgData) return;
+    const rect = leftCanvas.getBoundingClientRect();
+    const x = Math.floor((e.clientX - rect.left) * (leftCanvas.width / rect.width));
+    const y = Math.floor((e.clientY - rect.top)  * (leftCanvas.height / rect.height));
+
+    // Need margin for 21x21 and for context box
+    const k = ensureOdd(ctxSize);
+    const hCtx = (k-1)/2;
+    if (x < Math.max(HALF, hCtx) || x >= iw - Math.max(HALF, hCtx) ||
+        y < Math.max(HALF, hCtx) || y >= ih - Math.max(HALF, hCtx)) {
+      leftStatus.innerHTML = `<span class="bad">Selection too close to edge. Need ≥10px (zoom) and ≥${hCtx}px (context) margin.</span>`;
+      return;
+    }
+    selection = {x,y};
+    updateSelectionOutline();
+    recalcMatches();
+    drawZoom();
+    leftStatus.textContent = `Selected (${x},${y}). Matches found: ${matchCenters.length}.`;
+    // Scroll selection into view
+    selectionOutline.scrollIntoView({ block:'center', inline:'center', behavior:'smooth' });
+  });
+
+  // Context size slider
+  ctxSizeInput.addEventListener('input', () => {
+    ctxSize = +ctxSizeInput.value;
+    ctxSize = clamp(ctxSize, 3, 10);
+    if (ctxSize % 2 === 0) ctxSize -= 1; // keep odd
+    ctxSizeLabel.textContent = String(ctxSize);
+    if (selection) {
+      // verify selection still valid with new context margin
+      const hCtx = (ctxSize-1)/2;
+      if (selection.x < Math.max(HALF, hCtx) || selection.x >= iw - Math.max(HALF, hCtx) ||
+          selection.y < Math.max(HALF, hCtx) || selection.y >= ih - Math.max(HALF, hCtx)) {
+        leftStatus.innerHTML = `<span class="bad">Context too large for current selection; pick a new center.</span>`;
+        matchCenters = [];
+        drawZoom();
+        return;
+      }
+      recalcMatches();
+      drawZoom();
+      leftStatus.textContent = `Context ${ctxSize}×${ctxSize}. Matches: ${matchCenters.length}.`;
+    }
+  });
+
+  // Undo all
+  undoBtn.addEventListener('click', () => {
+    if (!originalImgData) return;
+    editedImgData = new ImageData(new Uint8ClampedArray(originalImgData.data), iw, ih);
+    drawBoth();
+    drawZoom();
+    rightStatus.textContent = `Edits reverted.`;
+  });
+
+  // Painting in zoom (click or drag)
+  function paintFromZoom(ev) {
+    if (!selection || !editedImgData) return;
+    const rect = zoomCanvas.getBoundingClientRect();
+    const zx = Math.floor((ev.clientX - rect.left) * (zoomCanvas.width / rect.width));
+    const zy = Math.floor((ev.clientY - rect.top)  * (zoomCanvas.height / rect.height));
+    const dx = Math.floor(zx / ZS) - HALF;
+    const dy = Math.floor(zy / ZS) - HALF;
+    if (dx < -HALF || dx > HALF || dy < -HALF || dy > HALF) return;
+    applyPaintAt(dx, dy, currentColor);
+  }
+  zoomCanvas.addEventListener('mousedown', (e) => { if (e.button===0) { isPainting = true; paintFromZoom(e); } });
+  window.addEventListener('mouseup',   () => { isPainting = false; });
+
+  // ====== Init with a tiny checkerboard so UI is live even before load ======
+  (function initDemo() {
+    const w=64,h=64, cell=8;
+    leftCanvas.width = rightCanvas.width = w;
+    leftCanvas.height = rightCanvas.height = h;
+    const temp = new ImageData(w,h);
+    for (let y=0;y<h;y++) for (let x=0;x<w;x++) {
+      const on = ((Math.floor(x/cell)+Math.floor(y/cell))%2)===0;
+      const c = on ? [220,220,220,255] : [180,180,180,255];
+      setPixel(temp.data, x,y,w, c);
+    }
+    lctx.putImageData(temp,0,0);
+    rctx.putImageData(temp,0,0);
+    originalImgData = lctx.getImageData(0,0,w,h);
+    editedImgData   = rctx.getImageData(0,0,w,h);
+    iw=w; ih=h;
+    buildPaletteFrom(originalImgData);
+    drawZoom();
+    leftStatus.textContent = 'Paste (Ctrl/Cmd+V) or use Load to insert an image.';
+    rightStatus.textContent = 'Edited image (live).';
+  })();
+})();
+</script>
+</body>
+</html>
